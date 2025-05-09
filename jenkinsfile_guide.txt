@@ -1,0 +1,71 @@
+pipeline {
+    agent any   // Az 'agent any' azt jelenti, hogy a pipeline bármelyik elérhető Jenkins agenten (node-on) futhat.
+
+    options {
+        timeout(time: 30, unit: 'MINUTES')   // Ha a pipeline több mint 30 percig fut, automatikusan leállítja a Jenkins.
+        buildDiscarder(logRotator(numToKeepStr: '10'))  // Csak az utolsó 10 buildet őrzi meg, hogy ne foglaljon sok tárhelyet.
+        skipStagesAfterUnstable()  // Ha egy szakasz 'unstable' státuszba kerül, a további szakaszokat kihagyja.
+    }
+
+    environment {
+        PROJECT_NAME = 'SampleProject'  // Globális környezeti változó, amit minden stage és step elérhet.
+    }
+
+    stages {  // Itt definiáljuk a pipeline fő szakaszait (stages).
+
+        stage('Előkészítés') {  // Első szakasz: előkészítő műveletek, pl. forráskód letöltése.
+            steps {
+                echo "Projekt neve: ${env.PROJECT_NAME}"  // Kiírja a projekt nevét a konzolra.
+                checkout scm   // Letölti a forráskódot a Jenkins által beállított SCM (pl. Git) alapján.
+            }
+        }
+
+        stage('Build') {  // Második szakasz: az alkalmazás összeállítása, fordítása.
+            steps {
+                sh './build.sh'  // Lefuttat egy shell szkriptet, ami például buildeli a projektet.
+            }
+        }
+
+        stage('Tesztelés') {  // Harmadik szakasz: automatikus tesztek futtatása.
+            steps {
+                sh './run_tests.sh'  // Teszteket futtató shell szkript meghívása.
+            }
+        }
+
+        stage('Deploy') {  // Negyedik szakasz: az alkalmazás telepítése tesztkörnyezetbe.
+            when {
+                branch 'main'  // Csak akkor fusson ez a szakasz, ha a 'main' ágon vagyunk.
+            }
+            steps {
+                sh './deploy.sh'  // Lefuttatja a telepítési szkriptet.
+            }
+        }
+    }
+
+    post {  // A 'post' szekció speciális: mindig a pipeline futása után történik, az eredménytől függően.
+        success {
+            echo 'Build sikeres volt!'  // Ha minden rendben ment, ezt írja ki.
+        }
+        failure {
+            echo 'Build sikertelen volt!'  // Ha bárhol hibázik a pipeline, ezt írja ki.
+        }
+        always {
+            cleanWs()  // Mindig lefut: törli a workspace-et, hogy ne maradjanak hátra fájlok.
+        }
+    }
+}
+
+
+_________________________________________________________________________________________________________________________
+
+agent – hol fusson a pipeline.
+
+options – időkorlát, buildek megőrzése, szakaszok átugrása.
+
+environment – globális változók definiálása.
+
+stages – a fő lépések/szakaszok, pl. build, tesztelés, deploy.
+
+steps – minden stage-ben konkrét parancsok futnak.
+
+post – eredménytől független utómunkálatok.
