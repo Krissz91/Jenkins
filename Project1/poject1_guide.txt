@@ -1,0 +1,30 @@
+1. Általános felépítés
+Ez a Jenkins pipeline deklarációs típusú, és a pipeline blokkot használja a feladatok szekvenciális végrehajtására.
+  agent any: Ez azt jelenti, hogy a pipeline bármelyik elérhető node-on futhat.
+  tools: A MAVEN3.9 és JDK17 meg vannak adva, tehát biztosítja, hogy ezeket a verziókat használja a pipeline a build során.
+
+Stages (szakaszok)
+Stage 1: Fetch code
+  Feladat: Git-ből letöltjük a kódot az atom nevű ágról.
+  Miért van szükség rá?: A pipeline első lépése mindig a forráskód letöltése, hogy a következő szakaszokban dolgozhassunk vele.
+Stage 2: Build
+  Feladat: A mvn install -DskipTests parancsot futtatja, ami a Maven segítségével felépíti a projektet, de a teszteket kihagyja a gyorsabb build érdekében.
+  Post-build: Ha a build sikeres, akkor az artefaktumokat archiválja (itt .war fájlok), így később elérhetőek lesznek a Nexus vagy más rendszerek számára.
+Stage 3: UNIT TEST
+  Feladat: Maven segítségével unit teszteket futtat.
+  Miért van szükség rá?: Az automatikus tesztelés a kód minőségének fenntartásához szükséges, hogy hibákra derüljön fény már korai fázisban.
+Stage 4: Checkstyle Analysis
+  Feladat: A kódstílus ellenőrzésére a Checkstyle plugin futtatása.
+  Miért van szükség rá?: A kód minősége és olvashatósága érdekében a Checkstyle elemzi a kódot a szabványoknak való megfelelés érdekében.
+Stage 5: Sonar Code Analysis
+  Feladat: A SonarQube segítségével kód minőségellenőrzést végez (pl. bugok, kódduplikáció, stb.).
+  Miért van szükség rá?: A SonarQube használatával automatikusan észlelhetjük a problémákat, amelyeket a kód felülvizsgálata előtt korrigálhatunk.
+Stage 6: Quality Gate
+  Feladat: A SonarQube minőségi kapu állapotának figyelése.
+  Miért van szükség rá?: Ha a SonarQube által végzett minőségellenőrzés nem teljesíti a minimális szabványokat (pl. túl sok hiba), akkor a pipeline megszakad.
+Stage 7: UploadArtifact
+  Feladat: A vprofile-v2.war fájlt feltölti a Nexus repository-ba.
+  Miért van szükség rá?: Az artefaktumok (pl. war fájlok) tárolása és elérhetősége érdekében a Nexus vagy más hasonló rendszerek segítségével lehetőség van a későbbi használatra vagy deploy-ra.
+Összegzés:
+Ez a Jenkinsfile egy tipikus Java webalkalmazás buildelését, tesztelését, minőségellenőrzését és artefaktum feltöltését automatizálja.
+Minden egyes szakasz fontos része a folyamatos integrációs és fejlesztési folyamatnak.
