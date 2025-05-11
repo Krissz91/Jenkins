@@ -1,0 +1,1281 @@
+# Bevezetés----------------------------------------------------------------------------------------
+
+Ebben a projektben egy Jenkins-alapú CI/CD rendszert építünk fel az AWS felhőszolgáltatás segítségével.
+A célunk egy automatizált, megbízható fejlesztői környezet kialakítása,
+amely támogatja a kód építését, elemzését, verziókezelését,
+valamint az artefaktumok kezelését és értesítések küldését.
+
+Használt eszközök:
+
+Jenkins – Folyamatos integrációs szerver
+Git / GitHub – Verziókövetés és távoli tároló
+Maven – Build és függőségkezelő eszköz
+Checkstyle – Kódelemző eszköz
+Slack – Értesítési csatorna
+Sonatype Nexus – Artefaktum-tároló szerver
+SonarQube – Forráskód-elemző platform (PostgreSQL és Nginx alapszolgáltatásokkal)
+AWS EC2 – Felhő alapú számítási erőforrás
+
+Telepítési lépések áttekintése:
+
+1. Jelentkezz be az AWS fiókodba
+2. Hozz létre egy új Key Pair-t az EC2 példányokhoz
+3. Készíts el három Security Group-ot:
+	a. Jenkins
+	b. Nexus
+	c. SonarQube
+4. Hozz létre három EC2 példányt, mindegyiket a saját szerepkörének megfelelő adatokkal:
+	a. Jenkins szerver
+	b. Nexus szerver
+	c. SonarQube szerver
+5. Telepítés után konfiguráld a rendszereket:
+	a. Jenkins: alapbeállítások és bővítmények telepítése
+	b. Nexus: alapbeállítás és repository konfigurálása
+	c. SonarQube: első belépés és működés tesztelése
+6. Készíts egy új GitHub repositoryt, és töltsd fel a projektkódot
+7. Hozz létre egy Jenkins buildfeladatot Nexus integrációval
+8. Állítsd be a GitHub Webhookot a Jenkins automatikus triggereléséhez
+9. Integráld a SonarQube szervert a Jenkins projektbe
+10. Valósítsd meg az artefaktumok feltöltését a Nexus tárolóba
+11. Konfigurálj Slack értesítéseket a build státuszairól
+
+# Security Group & Key Pair beállítása-------------------------------------------------------------
+
+Ebben a fejezetben létrehozzuk az EC2 példányokhoz szükséges Key Pair-t,
+valamint az egyes komponensekhez külön-külön Security Group-okat konfigurálunk a szükséges portszabályokkal.
+
+1. Key Pair létrehozása (RSA, .pem formátumban)
+  a. Jelentkezz be az AWS Management Console-ba
+  b. Navigálj az EC2 szolgáltatáshoz
+  c. A bal oldali menüben válaszd a Key Pairs lehetőséget
+  d. Kattints a Create key pair gombra
+  e. Állítsd be az alábbiakat:
+	Name: vprofile-ci-key
+	Key pair type: RSA
+	Private key file format: .pem
+  f. Kattints a Create key pair gombra
+
+A kulcs automatikusan letöltődik – mentsd el a Downloads mappából biztonságos helyre.
+
+2. Security Group-ok létrehozása
+
+a) Jenkins Security Group (jenkins-sg)
+  a. EC2 oldalon válaszd a bal menüben: Security Groups -> Create security group
+  b. Beállítások:
+	Name / Description: jenkins-sg
+	VPC: hagyd a default értéken
+  c. Inbound szabályok:
+	Port 22 – Forrás: My IP (SSH)
+	Port 8080 – Forrás: Anywhere (IPv4)
+	Port 8080 – Forrás: Anywhere (IPv6)
+  d. Az Outbound szabályokhoz nem kell nyúlni
+  e. Kattints a Create security group gombra
+
+b) Nexus Security Group (nexus-sg)
+  a. Create security group
+  b. Beállítások:
+	Name / Description: nexus-sg
+	VPC: default
+  c. Inbound szabályok:
+	Port 22 – Forrás: My IP
+	Port 8081 – Forrás: My IP
+	Port 8081 – Forrás: jenkins-sg (biztonságos belső kommunikáció Jenkins felől)
+  d. Outbound szabályokat hagyd változatlanul
+  e. Create security group
+
+c) SonarQube Security Group (sonar-sg)
+  a. Create security group
+  b. Beállítások:
+	Name / Description: sonar-sg
+	VPC: default
+  c. Inbound szabályok:
+	Port 22 – Forrás: My IP
+	Port 80 – Forrás: My IP
+	Port 80 – Forrás: jenkins-sg (Jenkins eléri a SonarQube-ot)
+  d. Outbound szabályokat ne módosítsd
+  e. Create security group
+
+3. Utólagos módosítás a Jenkins SG-n
+
+Most, hogy létrehoztuk mindhárom Security Group-ot, végezzük el a következő finomhangolást:
+Térj vissza a jenkins-sg biztonsági csoporthoz
+Válaszd a "Edit inbound rules"
+Adj hozzá egy új szabályt:
+  Port: 8080
+  Source: sonar-sg (Ez biztosítja, hogy a SonarQube is vissza tudjon kommunikálni Jenkins irányába, ha szükséges)
+
+Áttekintés:
+Létrejött egy vprofile-ci-key nevű kulcspár
+Három különálló Security Group: jenkins-sg, nexus-sg, sonar-sg
+Minden szükséges port engedélyezve a megfelelő forrásból
+Biztonságos kapcsolat biztosítva SSH és HTTP/HTTP-alapú szolgáltatásokhoz
+
+# EC2 Szerverek beállítása (Jenkins, Nexus, SonarQube)---------------------------------------------
+
+Ebben a részben három különböző EC2 példányt hozunk létre:
+Jenkins, Nexus és SonarQube célokra.
+Mindegyikhez saját telepítési scriptet használunk, amit a GitHub projekt userdata mappájából szerzünk be.
+Ezeket a scripteket az EC2 User Data mezőjébe illesztjük,
+így az indítás után automatikusan települnek a szükséges komponensek.
+
+1. Jenkins Server létrehozása
+Forrás:
+https://github.com/hkhcoder/vprofile-project
+Váltás a jenkins-ci ágra → userdata/jenkins-setup.sh
+
+Script tartalma:
+
+#!/bin/bash
+sudo apt update
+sudo apt install openjdk-17-jdk -y
+sudo wget -O /usr/share/keyrings/jenkins-keyring.asc https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key
+echo "deb [signed-by=/usr/share/keyrings/jenkins-keyring.asc] https://pkg.jenkins.io/debian-stable binary/" | sudo tee /etc/apt/sources.list.d/jenkins.list > /dev/null
+sudo apt-get update
+sudo apt-get install jenkins -y
+
+EC2 indítása:
+Name: JenkinsServer
+AMI: Ubuntu (Quick Start)
+Instance Type: t2.small
+Key Pair: vprofile-ci-key
+Security Group: jenkins-sg
+Advanced Details → User Data: Illeszd be a fenti scriptet
+Launch instance
+
+2. Nexus Server létrehozása
+Script elérhetőség:
+userdata/nexus-setup.sh (GitHub)
+
+Script tartalma:
+
+#!/bin/bash
+
+sudo rpm --import https://yum.corretto.aws/corretto.key
+sudo curl -L -o /etc/yum.repos.d/corretto.repo https://yum.corretto.aws/corretto.repo
+
+sudo yum install -y java-17-amazon-corretto-devel wget -y
+
+mkdir -p /opt/nexus/
+mkdir -p /tmp/nexus/
+cd /tmp/nexus/
+NEXUSURL="https://download.sonatype.com/nexus/3/nexus-unix-x86-64-3.78.0-14.tar.gz"
+wget $NEXUSURL -O nexus.tar.gz
+sleep 10
+EXTOUT=`tar xzvf nexus.tar.gz`
+NEXUSDIR=`echo $EXTOUT | cut -d '/' -f1`
+sleep 5
+rm -rf /tmp/nexus/nexus.tar.gz
+cp -r /tmp/nexus/* /opt/nexus/
+sleep 5
+useradd nexus
+chown -R nexus.nexus /opt/nexus
+cat <<EOT>> /etc/systemd/system/nexus.service
+[Unit]
+Description=nexus service
+After=network.target
+
+[Service]
+Type=forking
+LimitNOFILE=65536
+ExecStart=/opt/nexus/$NEXUSDIR/bin/nexus start
+ExecStop=/opt/nexus/$NEXUSDIR/bin/nexus stop
+User=nexus
+Restart=on-abort
+
+[Install]
+WantedBy=multi-user.target
+
+EOT
+
+echo 'run_as_user="nexus"' > /opt/nexus/$NEXUSDIR/bin/nexus.rc
+systemctl daemon-reload
+systemctl start nexus
+systemctl enable nexus
+
+Rövidített kivonat, (teljes verzió fentebb megtalálható)
+Java telepítés (Amazon Corretto 17)
+Nexus tarball letöltése és telepítése
+Systemd service fájl létrehozása
+Automatikus indulás beállítása
+
+EC2 indítása:
+Name: NexusServer
+AMI: Amazon Linux
+Instance Type: t2.medium
+Key Pair: vprofile-ci-key
+Security Group: nexus-sg
+Advanced Details → User Data: Illeszd be a nexus-setup.sh scriptet
+Launch instance
+
+3. SonarQube Server létrehozása
+Script elérhetőség:
+userdata/sonar-setup.sh (GitHub)
+
+Script tartalma:
+
+#!/bin/bash
+cp /etc/sysctl.conf /root/sysctl.conf_backup
+cat <<EOT> /etc/sysctl.conf
+vm.max_map_count=262144
+fs.file-max=65536
+ulimit -n 65536
+ulimit -u 4096
+EOT
+cp /etc/security/limits.conf /root/sec_limit.conf_backup
+cat <<EOT> /etc/security/limits.conf
+sonarqube   -   nofile   65536
+sonarqube   -   nproc    409
+EOT
+
+sudo apt-get update -y
+sudo apt-get install openjdk-17-jdk -y
+sudo update-alternatives --config java
+
+java -version
+
+sudo apt update
+wget -q https://www.postgresql.org/media/keys/ACCC4CF8.asc -O - | sudo apt-key add -
+
+sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt/ `lsb_release -cs`-pgdg main" >> /etc/apt/sources.list.d/pgdg.list'
+sudo apt install postgresql postgresql-contrib -y
+#sudo -u postgres psql -c "SELECT version();"
+sudo systemctl enable postgresql.service
+sudo systemctl start  postgresql.service
+sudo echo "postgres:admin123" | chpasswd
+runuser -l postgres -c "createuser sonar"
+sudo -i -u postgres psql -c "ALTER USER sonar WITH ENCRYPTED PASSWORD 'admin123';"
+sudo -i -u postgres psql -c "CREATE DATABASE sonarqube OWNER sonar;"
+sudo -i -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE sonarqube to sonar;"
+systemctl restart  postgresql
+#systemctl status -l   postgresql
+netstat -tulpena | grep postgres
+sudo mkdir -p /sonarqube/
+cd /sonarqube/
+sudo curl -O https://binaries.sonarsource.com/Distribution/sonarqube/sonarqube-9.9.8.100196.zip
+sudo apt-get install zip -y
+sudo unzip -o sonarqube-9.9.8.100196.zip -d /opt/
+sudo mv /opt/sonarqube-9.9.8.100196/ /opt/sonarqube
+sudo groupadd sonar
+sudo useradd -c "SonarQube - User" -d /opt/sonarqube/ -g sonar sonar
+sudo chown sonar:sonar /opt/sonarqube/ -R
+cp /opt/sonarqube/conf/sonar.properties /root/sonar.properties_backup
+cat <<EOT> /opt/sonarqube/conf/sonar.properties
+sonar.jdbc.username=sonar
+sonar.jdbc.password=admin123
+sonar.jdbc.url=jdbc:postgresql://localhost/sonarqube
+sonar.web.host=0.0.0.0
+sonar.web.port=9000
+sonar.web.javaAdditionalOpts=-server
+sonar.search.javaOpts=-Xmx512m -Xms512m -XX:+HeapDumpOnOutOfMemoryError
+sonar.log.level=INFO
+sonar.path.logs=logs
+EOT
+
+cat <<EOT> /etc/systemd/system/sonarqube.service
+[Unit]
+Description=SonarQube service
+After=syslog.target network.target
+
+[Service]
+Type=forking
+
+ExecStart=/opt/sonarqube/bin/linux-x86-64/sonar.sh start
+ExecStop=/opt/sonarqube/bin/linux-x86-64/sonar.sh stop
+
+User=sonar
+Group=sonar
+Restart=always
+
+LimitNOFILE=65536
+LimitNPROC=4096
+
+
+[Install]
+WantedBy=multi-user.target
+EOT
+
+systemctl daemon-reload
+systemctl enable sonarqube.service
+#systemctl start sonarqube.service
+#systemctl status -l sonarqube.service
+apt-get install nginx -y
+rm -rf /etc/nginx/sites-enabled/default
+rm -rf /etc/nginx/sites-available/default
+cat <<EOT> /etc/nginx/sites-available/sonarqube
+server{
+    listen      80;
+    server_name sonarqube.groophy.in;
+
+    access_log  /var/log/nginx/sonar.access.log;
+    error_log   /var/log/nginx/sonar.error.log;
+
+    proxy_buffers 16 64k;
+    proxy_buffer_size 128k;
+
+    location / {
+        proxy_pass  http://127.0.0.1:9000;
+        proxy_next_upstream error timeout invalid_header http_500 http_502 http_503 http_504;
+        proxy_redirect off;
+              
+        proxy_set_header    Host            \$host;
+        proxy_set_header    X-Real-IP       \$remote_addr;
+        proxy_set_header    X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header    X-Forwarded-Proto http;
+    }
+}
+EOT
+ln -s /etc/nginx/sites-available/sonarqube /etc/nginx/sites-enabled/sonarqube
+systemctl enable nginx.service
+#systemctl restart nginx.service
+sudo ufw allow 80,9000,9001/tcp
+
+echo "System reboot in 30 sec"
+sleep 30
+reboot
+
+Fontosabb lépések:
+Rendszerbeállítások (sysctl, limits.conf)
+PostgreSQL telepítése és konfigurálása
+SonarQube letöltése és service konfigurálása
+NGINX proxy szerver telepítése és beállítása
+Portok megnyitása, reboot
+
+EC2 indítása:
+Name: SonarServer
+AMI: Ubuntu (Quick Start)
+Instance Type: t2.medium
+Key Pair: vprofile-ci-key
+Security Group: sonar-sg
+Advanced Details → User Data: Illeszd be a sonar-setup.sh scriptet
+Launch instance
+
+Áttekintés:
+Server		AMI		Instance	Security Group	User Data Script
+Jenkins		Ubuntu		t2.small	jenkins-sg	jenkins-setup.sh
+Nexus		Amazon Linux	t2.medium	nexus-sg	nexus-setup.sh
+SonarQube	Ubuntu		t2.medium	sonar-sg	sonar-setup.sh
+
+Ezek után érdemes várni pár percet, amíg az instanciák elvégzik az automatikus telepítést.
+
+# Post-Installation lépések------------------------------------------------------------------------
+
+Ebben a fejezetben az EC2 példányok inicializálása utáni beállításokat és ellenőrzéseket végezzük el.
+Megnézzük, hogy a Jenkins, Nexus és SonarQube szerverek megfelelően működnek-e,
+valamint konfiguráljuk a szükséges kezdő lépéseket (admin jelszavak, pluginok, repo-k).
+
+1. Csatlakozás a Jenkins szerverhez
+SSH kapcsolat létrehozása:
+ssh -i ~/Downloads/vprofile-ci-key.pem ubuntu@<JENKINS_PUBLIC_IP>
+
+Mac-en futtasd előtte:
+chmod 700 ~/Downloads/vprofile-ci-key.pem
+
+Ha először csatlakozol, írd be: yes
+
+Ha újra szeretnéd, hogy kérdezzen (pl. IP változás esetén)
+cat /dev/null > ~/.ssh/known_hosts
+
+2. Jenkins állapotellenőrzés és konfiguráció
+sudo -i
+clear
+systemctl status jenkins        # 'active' = minden rendben
+java --version                  # JDK verzió ellenőrzés
+ls /usr/lib/jvm                 # Ellenőrizd, hogy a JDK a helyén van
+ls /var/lib/jenkins             # Jenkins fájlok elérhetőek
+
+Webes hozzáférés:
+Nyisd meg a böngészőt:
+http://<JENKINS_PUBLIC_IP>:8080
+
+Másold ki az oldalon megjelenő fájl elérési utat:
+cat /var/lib/jenkins/secrets/initialAdminPassword
+
+Másold be az oldalon a jelszó mezőbe -> Continue -> Install suggested plugins
+
+Admin fiók létrehozása:
+Username: admin
+Password: password (valós környezetben erős jelszót használj!)
+Full name: Admin
+Email: mymail@mail.com
+Save and continue -> Save and finish -> Start using Jenkins
+
+Pluginok telepítése:
+Navigálj: Manage Jenkins -> Plugins -> Available plugins
+A keresőbe sorban írd be és pipáld ki:
+  Maven Integration
+  GitHub Integratio
+  Nexus Artifact Uploader
+  SonarQube Scanner
+  Slack Notification
+  Build Timestamp
+
+Kattints a jobb felső Install without restart gombra
+
+3. Nexus szerver ellenőrzés és beállítás
+SSH kapcsolat:
+ssh -i ~/Downloads/vprofile-ci-key.pem ec2-user@<NEXUS_PUBLIC_IP>
+sudo -i
+clear
+systemctl status nexus
+
+Böngésző:
+http://<NEXUS_PUBLIC_IP>:8081
+
+Admin jelszó lekérése:
+cat /opt/nexus/sonatype-work/nexus3/admin.password
+Username: admin
+Password: (amit a fenti paranccsal lekértél)
+Sign in -> Next -> Új jelszó: password -> Next -> Agree -> Disable anonymous access -> Finish
+
+Repository-k létrehozása:
+Navigálj a fogaskerék ikonra (Admin menü) -> Repositories -> Create repository
+  Maven2 (hosted) → vprofile-release
+  Maven2 (proxy) → vpro-maven-central
+	Remote Storage: https://repo1.maven.org/maven2/
+  Maven2 (hosted) → vprofile-snapshot
+	Version policy: Snapshot
+  Maven2 (group) → vpro-maven-group
+	Tagok: vpro-maven-central, vprofile-release, vprofile-snapshot
+
+4. SonarQube szerver ellenőrzése
+Böngésző:
+http://<SONAR_PUBLIC_IP>
+
+Ha az oldal betölt, minden rendben.
+Bejelentkezés:
+  Username: admin
+  Password: admin
+
+Az első bejelentkezés után:
+  Old password: admin
+  New password / Confirm: password (valós környezetben erősebb jelszó!)
+
+Összefoglalás:
+Szolgáltatás	Ellenőrzési URL			SSH parancs példa						Fontos lépések
+Jenkins		http://<JENKINS_IP>:8080	ssh -i ~/Downloads/vprofile-ci-key.pem ubuntu@JENKINS_IP	Plugin install
+Nexus		http://<NEXUS_IP>:8081		ssh -i ~/Downloads/vprofile-ci-key.pem ec2-user@NEXUS_IP	Repo setup
+SonarQube	http://<SONAR_IP>		ssh -i ~/Downloads/vprofile-ci-key.pem ubuntu@SONAR_IP		Admin config
+
+# Git Code Migration-------------------------------------------------------------------------------
+
+Ebben a fejezetben a meglévő Jenkins-projekt kódját átmigráljuk saját GitHub fiókunkba,
+beállítjuk az SSH kulcsokat a hitelesítéshez, és végzünk egy teszt commitot a jenkins-ci ágra.
+
+1. Fork készítése
+Nyisd meg:
+  https://github.com/hkhcoder/vprofile-project
+Jelentkezz be saját GitHub fiókodba:
+  https://github.com/Krissz91/
+Az eredeti repo oldalán kattints a Fork gombra
+Fontos: Vedd ki a pipát a “Copy the main branch only” opcióból
+Győződj meg róla, hogy a saját fiók van kiválasztva -> Kattints: Create fork
+A forkolt repo oldalán állítsd át az ágat jenkins-ci-ra
+
+2. Git globális beállítások a terminálban
+git config --global user.email "gipsz.jakab@valamimail.com"
+git config --global user.name "krissz91"
+
+3. SSH kulcs generálás
+cd ~/.ssh
+ssh-keygen
+Adj meg fájlnevet pl.: Krissz91 (ENTER)
+Jelszó nem kötelező (ENTER)
+ls
+Látható: Krissz91 és Krissz91.pub
+
+Másold ki a kulcs tartalmát:
+cat Krissz91.pub
+
+Menj a GitHub fiókodra:
+Settings -> SSH and GPG keys -> New SSH Key
+  Title: feedyourlaptop (teljesen mindegy mit adsz meg ez jutott eszmbe)
+  Key: ide illeszd be a .pub fájl tartalmát
+  Add SSH key
+
+4. SSH config fájl beállítása (több fiókhoz is)
+nano config az ~/.ssh mappaban
+
+Add hozzá:
+
+Host github.com-Krissz91
+  User git
+  IdentityFile ~/.ssh/Krissz91
+  HostName github.com
+
+Host github.com-Chris91
+  User git
+  IdentityFile ~/.ssh/Chris91
+  HostName github.com
+
+5. Projekt klónozása saját GitHub fiókból
+cd
+mkdir jenkins-ci
+cd jenkins-ci
+
+Menj ide:
+https://github.com/Krissz91/vprofile-project
+
+Kattints a Code gombra
+Válts SSH-ra
+Másold ki az URL-t, és a következőt írd be a terminálba:
+
+git clone git@github.com-Krissz91:Krissz91/vprofile-project.git com  és : koze ird -Krissz91
+cd vprofile-project
+git checkout jenkins-ci
+
+Ellenőrizd a configot:
+cat .git/config
+
+6. Teszt commit
+nano README.md
+
+Adj hozzá néhány `####` vagy bármilyen sort
+git add .
+git commit -m "test commit"
+git push origin jenkins-ci
+
+Menj vissza GitHubra -> Ellenőrizd, hogy a jenkins-ci ágon frissült-e a README.md
+
+7. VSCode megnyitás
+Nyisd meg VSCode-ot:
+code .
+
+vagy:
+  File → Open Folder → Válaszd ki a vprofile-project mappát
+  Bal oldali sávban kattints a Source Control ikonra (Git jel) -> commit -> commit&push
+  Írd be a commit üzenetet
+  Kattints a ✔ (commit) ikonra -> save
+  Commit & Push → Küldi a GitHubra
+
+# Tools & Credentials beállítása Jenkinsben--------------------------------------------------------
+
+Ebben a részben Jenkinsen belül frissítjük a szerver URL-t,
+telepítünk több JDK verziót, Maven-t, valamint létrehozunk egy hitelesítő adatot a Nexus integrációhoz.
+
+1. Ellenőrzés indítás után
+Fontos: Ha újraindítottad a szervereket, új public IP-t kaptak!
+Ellenőrizd, hogy a Security Group-ban a source = MyIP beállítás továbbra is él
+(különösen a 22-es portnál és 8080-nál)
+
+2. Jenkins elérés és bejelentkezés
+Másold ki a JenkinsServer új Public IPv4 címét, majd a böngészőbe írd be:
+http://<JENKINS_PUBLIC_IP>:8080
+
+Jelentkezz be:
+Username: admin
+Password: password
+
+3. Jenkins URL frissítése
+Navigáció:
+
+Manage Jenkins -> System -> Jenkins Location
+
+Frissítsd az URL mezőt az új IP-címmel:
+http://<JENKINS_PUBLIC_IP>:8080
+
+Save
+
+4. JDK-k hozzáadása Jenkinsben
+Navigáció:
+
+Manage Jenkins -> Global Tool Configuration -> JDK -> Add JDK
+
+JDK17 hozzáadása
+  Name: JDK17
+  Vedd ki a pipát a "Install automatically" opció elől
+  JAVA_HOME: /usr/lib/jvm/java-1.17.0-openjdk-amd64
+
+Ellenőrizd SSH-n keresztül:
+ssh -i ~/Downloads/vprofile-ci-key.pem ubuntu@<JENKINS_PUBLIC_IP>
+sudo -i
+ls /usr/lib/jvm
+
+JDK21 telepítése
+apt update && apt install openjdk-21-jdk -y
+cd /usr/lib/jvm/
+ls -l
+
+Jenkinsben:
+Add JDK
+Name: JDK21
+JAVA_HOME: /usr/lib/jvm/java-1.21.0-openjdk-amd64
+
+5. Maven hozzáadása
+Navigáció:
+Manage Jenkins -> Global Tool Configuration -> Maven -> Add Maven
+  Name: MAVEN3.9
+  Version: 3.9.9
+  Save
+
+6. Hitelesítő adat hozzáadása (Nexus login)
+Navigáció:
+Manage Jenkins -> Credentials -> (global) -> Add Credentials
+  Kind: Username with password
+  Username: admin
+  Password: password
+  ID: nexuslogin
+  Description: nexuslogin
+  Create
+
+Összefoglalás
+Eszköz		Név		Részletek
+JDK 17		JDK17		/usr/lib/jvm/java-1.17.0-openjdk-amd64
+JDK 21		JDK21		/usr/lib/jvm/java-1.21.0-openjdk-amd64
+Maven		MAVEN3.9	Verzió: 3.9.9 (auto install)
+Credential	nexuslogin	Felhasználó: admin, Jelszó: password (Global)
+
+# Build Job with Nexus Repository------------------------------------------------------------------
+
+Ebben a részben Jenkinsben létrehozunk egy Pipeline jobot,
+ami a forkolt GitHub repository-ból húzza a kódot,
+majd Maven segítségével buildeli azt, és feltölti a Nexus tárolóba.
+
+1. Új Jenkins Pipeline létrehozása
+Lépések:
+  Nyisd meg a Jenkins weboldalát
+	http://<JENKINS_PUBLIC_IP>:8080
+  Kattints a Dashboard-on: -> New Item
+  Name: vprofile-ci-pipeline
+  Válaszd: Pipeline -> OK
+
+Pipeline konfiguráció:
+  Definition: Pipeline script from SCM
+  SCM: Git
+
+Repository URL beállítása:
+  Menj a GitHubodra:
+	https://github.com/Krissz91/vprofile-project
+  Kattints a Code gombra ➤ válts SSH-ra
+  Másold ki az SSH URL-t, majd illeszd be Jenkinsbe
+
+SSH hitelesítés beállítása:
+  Credentials ➤ Add
+  Kind: SSH Username with private key
+  ID / Description: gitlogin
+  Username: git
+  Private Key: Enter directly
+
+Nyisd meg a terminált:
+cat ~/.ssh/Krissz91
+
+Másold be a kulcs tartalmát a Jenkins felületre ➤ Add
+Állítsd be a Credentials mezőt: git (gitlogin)
+
+A piros “Failed to connect” figyelmeztetés figyelmen kívül hagyható, ha az SSH kulcs helyes.
+
+Branch Specifier: jenkins-ci
+Script Path: Jenkinsfile
+Save
+
+2. Jenkinsfile létrehozása a projektben
+Nyisd meg a VSCode-ot vagy a terminált, és a vprofile-project könyvtárban hozz létre egy új fájlt:
+
+code Jenkinsfile
+Jenkinsfile tartalom:
+
+pipeline {
+    agent any
+    tools {
+        jdk "JDK17"
+        maven "MAVEN3.9"
+    }
+
+    environment {
+        SNAP_REPO = 'vprofile-snapshot'
+        RELEASE_REPO = 'vprofile-release'
+        CENTRAL_REPO = 'vpro-maven-central'
+        NEXUS_GRP_REPO = 'vpro-maven-group'
+        NEXUS_USER = 'admin'
+        NEXUS_PASS = 'password'
+        NEXUSIP = '172.31.43.144'       // Nexus EC2 privát IP-címe
+        NEXUSPORT = '8081'
+        NEXUS_LOGIN = 'nexuslogin'
+    }
+
+    stages {
+        stage('Build') {
+            steps {
+                sh 'mvn -s settings.xml -DskipTests install'
+            }
+        }
+    }
+}
+
+Győződj meg róla, hogy a Nexus szerver Private IPv4 címe van megadva!
+
+3. Git commit és push
+Ellenőrizd, hogy az ágazat jenkins-ci, majd futtasd:
+git add Jenkinsfile
+git commit -m "Add Jenkins pipeline"
+git push origin jenkins-ci
+
+4. Első build próbálkozás (elsőre hibás lesz)
+Jenkins Dashboard -> vprofile-ci-pipeline -> Build Now
+
+Hiba oka: a Jenkins user még nem ismerte fel a GitHub SSH kapcsolatot.
+
+5. Jenkins user SSH inicializálása
+A Jenkins szerveren:
+
+ssh -i ~/Downloads/vprofile-ci-key.pem ubuntu@<JENKINS_PUBLIC_IP>
+sudo -i
+su - jenkins
+ssh -T git@github.com
+
+Írd be: yes
+Ezzel a Jenkins user .ssh/known_hosts fájlja frissül.
+
+6. Újraindított Build
+Jenkins weboldalon:
+  Nyisd meg a vprofile-ci-pipeline jobot
+  Kattints: Build Now
+
+Most már zöld pipa lesz -> Console Output alján:
+  Finished: SUCCESS
+
+7. Nexus ellenőrzése
+Menj a Nexus weboldalára:
+  http://<NEXUS_PUBLIC_IP>:8081
+  Jelentkezz be: admin / password
+  Navigálj a Browse fülre
+  Ellenőrizd: vpro-maven-central, vprofile-release, vprofile-snapshot tárolókban már megjelentek a feltöltött artefaktok
+
+Összefoglalás:
+Lépés			Eredmény
+Pipeline létrehozva	GitHub-ról húz, Nexusba tölt
+SSH hitelesítés		gitlogin credential és .ssh beállítva
+Jenkinsfile		Buildel Maven-nel és feltölt a Nexusba
+Első build hibás volt	SSH trust hiányzott – javítva su - jenkins
+Nexus ellenőrzés	Artefaktok megjelentek a tárolóban
+
+# GitHub Webhook beállítása Jenkinshez-------------------------------------------------------------
+
+Cél: Ha bármilyen módosítást teszel a GitHub repository-ban (pl. Jenkinsfile frissítés),
+Jenkins automatikusan triggerelje a buildet – teljes CI folyamat emberi beavatkozás nélkül.
+
+1. Jenkins elérhetőségének biztosítása
+Security Group módosítás:
+  Menj az AWS konzolra -> EC2 -> Security Groups
+  Válaszd ki: jenkins-sg
+  Inbound rules:
+	Port: 8080 ➤ Source: Anywhere (IPv4) + Anywhere (IPv6)
+  Save
+
+Ellenőrzés:
+  Másold ki a Jenkins szerver Public IPv4 címét
+  Nyisd meg a böngészőben:
+http://<JENKINS_PUBLIC_IP>:8080
+
+2. GitHub Webhook beállítása
+  Lépj be saját repo-dba:
+	https://github.com/Krissz91/vprofile-project
+  Felül kattints a Settings fülre
+  Bal oldalon: Webhooks -> Add webhook
+  Állítsd be:
+
+Mező		Érték
+Payload URL	http://<JENKINS_PUBLIC_IP>:8080/github-webhook/
+Content Type	application/json
+Trigger		Just the push event
+
+  Add webhook
+  Kattints a webhook URL-re -> Recent Deliveries
+	Zöld pipa -> Ping sikeres -> GitHub <-> Jenkins kapcsolat él
+
+3. Jenkinsben trigger engedélyezése
+  Dashboard -> vprofile-ci-pipeline -> Configure
+  Görgess le: Build Triggers
+  Pipáld ki: GitHub hook trigger for GITScm polling
+  Save
+
+4. Jenkinsfile bővítése új szakaszokkal
+Menj a projekt könyvtárába (vscode) és szerkeszd a Jenkinsfile-t:
+
+pipeline {
+    agent any
+    tools {
+        jdk "JDK17"
+        maven "MAVEN3.9"
+    }
+    
+    environment {
+        SNAP_REPO = 'vprofile-snapshot'
+        NEXUS_USER = 'admin'
+        NEXUS_PASS = 'Adm1nAdm1n?12'
+        RELEASE_REPO = 'vprofile-release'
+        CENTRAL_REPO = 'vpro-maven-central'
+        NEXUSIP = '172.31.25.1'               // Private IP of Nexus EC2
+        NEXUSPORT = '8081'
+        NEXUS_GRP_REPO = 'vpro-maven-group'
+        NEXUS_LOGIN = 'nexuslogin'
+    }
+
+    stages {
+        stage('Build') {
+            steps {
+                sh 'mvn -s settings.xml -DskipTests install'
+            }
+            post {
+                success {
+                    echo "Now Archiving."
+                    archiveArtifacts artifacts: '**/*.war'
+                }
+            }
+        }
+
+        stage('Test') {
+            steps {
+                sh 'mvn -s settings.xml test'
+            }
+        }
+
+        stage('Checkstyle Analysis') {
+            steps {
+                sh 'mvn -s settings.xml checkstyle:checkstyle'
+            }
+        }
+    }
+}
+
+5. Commit & Push a GitHub-ra
+Terminal:
+git add Jenkinsfile
+git commit -m "new update"
+git push origin jenkins-ci
+
+vagy
+
+VSCode:
+Source Control panel -> írj commit üzenetet
+Commit & Push
+Kattints a ✔ pipára -> Save
+
+6. Jenkins automatikus build ellenőrzése
+  Látogasd meg a Jenkins weboldalt
+  A vprofile-ci-pipeline alatt látni fogod:
+	új zöld build automatikusan elindult
+  Console Output -> Finished: SUCCESS
+
+Többszöri módosítás után is:
+Minden alkalommal, amikor a jenkins-ci ágra push-olsz:
+  Jenkins automatikusan triggerel
+  Build lefut és a WAR fájl archiválásra kerül
+  A Nexus repo frissül
+
+Összefoglalás:
+Lépés			Eredmény
+Webhook hozzáadva	GitHub -> Jenkins közvetlen kommunikáció
+Jenkins trigger aktív	Automatikus build push eseményekre
+Jenkinsfile frissítve	Build + Test + Checkstyle lefut
+Pipeline sikeres	Jenkins -> Nexus artifact feltöltés működik
+
+# Code Analysis with SonarQube---------------------------------------------------------------------
+
+Ebben a szakaszban Jenkins és SonarQube összekapcsolásával automatikusan kódanalízist végzünk
+minden egyes build után, hogy már a fejlesztési fázisban is biztosítsuk a kódminőséget.
+
+1. Miért kell a SonarQube?
+A Jenkins build workspace-ben (/var/lib/jenkins/workspace/...) több XML és egyéb formátumú riport generálódik
+(checkstyle-result.xml, surefire-reports, stb.), amelyeket az ember nehezen értelmez.
+A SonarQube segítségével ezek vizuálisan elemezhetőek,
+és automatizált visszajelzést kapunk a kód hibáiról, komplexitásáról és stílusáról.
+
+2. SonarQube szerver ellenőrzése
+Lépj be a SonarQube szerverre:
+http://<SONAR_PUBLIC_IP>
+  Username: admin
+  Password: password
+
+3. Jenkins beállítása SonarQube-hoz
+Eszköz hozzáadása
+Manage Jenkins -> Global Tool Configuration -> SonarQube Scanner
+  Name: sonarscanner
+  Version: SonarQube Scanner 4.7.0.2747
+  Save
+
+SonarQube szerver hozzáadása
+Manage Jenkins -> System -> SonarQube servers
+  Pipáld ki: Environment variables
+  Add SonarQube
+	Name: sonarserver
+	Server URL: http://<SONAR_PRIVATE_IP>
+
+Private IP-t add meg az AWS EC2 példány adatlapjáról!
+
+4. Hitelesítés tokennel
+Token generálása SonarQube-ban:
+  Menj: My Account -> Security
+  Generate Token -> Name: jenkins
+  Generate -> Másold ki a tokent!
+
+Jenkinsben token rögzítése:
+Manage Jenkins -> Credentials -> (global) -> Add Credentials
+  Kind: Secret text
+  Secret: (amit az előbb másoltál)
+  ID / Description: sonartoken
+  Add
+
+SonarQube servers beállításnál:
+Authentication token = sonartoken
+
+5. Jenkinsfile bővítése SonarQube integrációval
+Bővítsd ki a meglévő Jenkinsfile-t a VSCode-ban
+
+pipeline {
+    agent any
+    tools {
+        jdk "JDK17"
+        maven "MAVEN3.9"
+    }
+
+    environment {
+        SNAP_REPO = 'vprofile-snapshot'
+        NEXUS_USER = 'admin'
+        NEXUS_PASS = 'Adm1nAdm1n?12'
+        RELEASE_REPO = 'vprofile-release'
+        CENTRAL_REPO = 'vpro-maven-central'
+        NEXUSIP = '172.31.25.1'
+        NEXUSPORT = '8081'
+        NEXUS_GRP_REPO = 'vpro-maven-group'
+        NEXUS_LOGIN = 'nexuslogin'
+        SONARSERVER = 'sonarserver'
+        SONARSCANNER = 'sonarscanner'
+    }
+
+    stages {
+        stage('Build') {
+            steps {
+                sh 'mvn -s settings.xml -DskipTests install'
+            }
+            post {
+                success {
+                    echo "Now Archiving."
+                    archiveArtifacts artifacts: '**/*.war'
+                }
+            }
+        }
+
+        stage('Test') {
+            steps {
+                sh 'mvn -s settings.xml test'
+            }
+        }
+
+        stage('Checkstyle Analysis') {
+            steps {
+                sh 'mvn -s settings.xml checkstyle:checkstyle'
+            }
+        }
+
+        stage('Sonar Analysis') {
+            environment {
+                scannerHome = tool "${SONARSCANNER}"
+            }
+            steps {
+                withSonarQubeEnv("${SONARSERVER}") {
+                    sh '''${scannerHome}/bin/sonar-scanner \
+                    -Dsonar.projectKey=vprofile \
+                    -Dsonar.projectName=vprofile \
+                    -Dsonar.projectVersion=1.0 \
+                    -Dsonar.sources=src/ \
+                    -Dsonar.java.binaries=target/test-classes/com/visualpathit/account/controllerTest/ \
+                    -Dsonar.junit.reportsPath=target/surefire-reports/ \
+                    -Dsonar.jacoco.reportsPath=target/jacoco.exec \
+                    -Dsonar.java.checkstyle.reportPaths=target/checkstyle-result.xml'''
+                }
+            }
+        }
+    }
+}
+
+6. Commit & Push
+Terminál:
+  git add Jenkinsfile
+  git commit -m "SonarQube integration"
+  git push origin jenkins-ci
+
+vagy
+
+VSCode:
+  Source Control -> Commit -> Commit&Push -> ✔ Pipára katt -> Save
+
+7. Eredmény ellenőrzése
+Jenkins:
+  Dashboard -> vprofile-ci-pipeline
+  Automatikusan elindul a build (webhook miatt)
+  Console Output -> Finished: SUCCESS
+
+SonarQube:
+  Böngészőben nyisd meg a szervert
+  Projects -> vprofile
+  Elemzés sikeres, riportok megjelennek (pl. kódhibák, duplikációk, test coverage, checkstyle...)
+
+Összefoglalás
+Lépés				Eredmény
+SonarQube szerver él		Weben elérhető és bejelentkezhető
+Jenkins konfigurálva		Scanner + Server + Token
+Jenkinsfile frissítve		Új Sonar Analysis stage
+Automatikus build		Webhook miatt nem kell manuálisan indítani
+Elemzési eredmény látható	SonarQube webes felületen projektszinten
+
+# SonarQube – Quality Gates------------------------------------------------------------------------
+
+A Quality Gate egy szabályrendszer a SonarQube-ban, amely automatikusan eldönti,
+hogy a kód megfelel-e bizonyos minőségi elvárásoknak.
+Ha a feltételek nem teljesülnek, a Jenkins pipeline automatikusan megszakad.
+
+1. Quality Gate létrehozása SonarQube-ban
+Lépj be a SonarQube felületére:
+http://<SONAR_PUBLIC_IP>
+  Username: admin
+  Password: password
+
+Beállítások:
+  Kattints a vprofile projektre
+  Project settings -> Quality Gate
+	Jelenleg: Sonar way
+  Felül: Quality Gates -> Create
+	Name: vprofileQG -> Save
+
+Feltétel hozzáadása:
+  Add condition -> On overall code -> Bugs
+  Operator: > -> Value: 25
+  Add condition
+
+Ez azt jelenti: ha több mint 25 bugot talál, a Quality Gate megbukik.
+
+2. Projecthez Quality Gate hozzárendelése
+Navigálj vissza a vprofile projekthez
+Project settings -> Quality Gate -> Select: vprofileQG -> Save
+
+3. Webhook hozzáadása Jenkins felé
+Project settings -> Webhooks -> Create
+  Name: jenkinswebhook
+  URL: http://<JENKINS_PRIVATE_IP>:8080/sonarqube-webhook
+  Használd a Jenkins szerver Private IPv4 címét!
+  Create
+
+4. Jenkinsfile módosítása – Quality Gate beépítése
+VSCode-ban bővítsd ki a Jenkinsfile-t a következő stage-szel a Sonar Analysis után:
+
+        stage("Quality Gate") {
+            steps {
+                timeout(time: 1, unit: 'HOURS') {
+                    // Pipeline megszakad, ha nem megy át a Quality Gate-en
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+Teljes pipeline új szakaszokkal már tartalmazza:
+  Build
+  Test
+  Checkstyle
+  Sonar Analysis
+  Quality Gate ellenőrzés
+
+5. Commit & Push
+Terminál:
+  git add Jenkinsfile
+  git commit -m "Add Quality Gate check"
+  git push origin jenkins-ci
+A webhook miatt a Jenkins automatikusan buildelni fog.
+
+Első build eredménye
+Jenkins Console Output:
+
+ERROR: Pipeline aborted due to quality gate failure: ERROR
+Finished: FAILURE
+
+Ez helyes viselkedés! Több mint 25 hiba miatt megbukott a Quality Gate.
+
+6. Quality Gate feltétele módosítása
+  SonarQube -> Quality Gates -> vprofileQG
+  Kattints a feltételre: bugs > 25
+  Value: módosítsd 100-ra -> Update condition
+
+Újraindítás
+  Menj vissza a Jenkinsbe -> vprofile-ci-pipeline
+  Build Now
+
+Most már sikeres lesz a pipeline, mivel kevesebb, mint 100 bug van a kódban.
+
+Összefoglalás
+Lépés				Eredmény
+Quality Gate létrehozása	vprofileQG nevű szabályrendszer elkészült
+Feltétel: bugs > 25		Build megszakad, ha túl sok hiba van
+Webhook beállítva		Sonar -> Jenkins automatikus visszajelzés
+Jenkinsfile frissítve		waitForQualityGate beépítve
+Pipeline bukás -> javítás	Feltétel enyhítése után újra sikeres
+
+
+# Publish Artifact to Nexus Repository-------------------------------------------------------------
+
+Ebben a lépésben a Jenkins által elkészített vprofile-v2.war fájlt automatikusan feltöltjük a Nexus repository-ba.
+A feltöltés során verzióozzuk az artefaktot a Jenkins build ID és időbélyeg alapján.
+
+1. Timestamp konfigurálása Jenkinsben
+  Jenkins -> Manage Jenkins -> System
+  Görgess le: Build Timestamp
+  Állítsd be a Pattern mezőt:
+	yy-MM-dd_HHmm
+  Save
+
+2. Nexus Artifact Uploader plugin dokumentáció
+Nyisd meg:
+https://github.com/jenkinsci/nexus-artifact-uploader-plugin
+Innen másold ki a nexusArtifactUploader példát.
+
+3. Jenkinsfile frissítése VSCode-ban – UploadArtifact stage hozzáadása
+
+        stage("UploadArtifact") {
+            steps {
+                nexusArtifactUploader(
+                    nexusVersion: 'nexus3',
+                    protocol: 'http',
+                    nexusUrl: "${NEXUSIP}:${NEXUSPORT}",
+                    groupId: 'QA',
+                    version: "${env.BUILD_ID}-${env.BUILD_TIMESTAMP}",
+                    repository: "${RELEASE_REPO}",
+                    credentialsId: "${NEXUS_LOGIN}",
+                    artifacts: [[
+                        artifactId: 'vproapp',
+                        classifier: '',
+                        file: 'target/vprofile-v2.war',
+                        type: 'war'
+                    ]]
+                )
+            }
+        }
+
+Fontos környezeti változók, amelyeknek korábban már a Jenkinsfile elején definiáltuk:
+  ${NEXUSIP}, ${NEXUSPORT} -> belső IP + 8081 port
+  ${NEXUS_LOGIN} -> Jenkins credential ID
+  ${RELEASE_REPO} -> vprofile-release Nexus repo neve
+
+4. Commit & Push
+Terminál:
+  git add Jenkinsfile
+  git commit -m "Add artifact upload to Nexus"
+  git push origin jenkins-ci
+
+vagy
+
+VSCode:
+  Source Control panel -> Commit -> Commit&Push -> ✔ gombra katt -> Save
+
+5. Jenkins pipeline futtatása
+  A Webhook aktiválja a pipeline-t automatikusan
+  Jenkins oldalon -> Console Output végén:
+	Finished: SUCCESS
+
+Lépj be a Nexus weboldalra:
+http://<NEXUS_PUBLIC_IP>:8081
+
+Navigálj: Browse -> vprofile-release
+
+Látni fogod a feltöltött struktúrát:
+
+QA/
+  vproapp/
+    <build_id>-<timestamp>/
+      vprofile-v2.war
+
+Új build = új verzió feltöltés
+Minden egyes Build Now indítás után a Jenkins egy új .war fájlt generál,
+ami verziózott névvel kerül feltöltésre a Nexusba.
+Így pontosan nyomon követhető, mikor melyik artefakt került buildelésre.
+
+Összefoglalás:
+Lépés				Eredmény
+Timestamp konfigurálva		Artefakt verzióozás Jenkins build idő alapján
+Jenkinsfile frissítve		Új UploadArtifact stage hozzáadva
+Artefakt feltöltés működik	.war fájl megjelenik a Nexus vprofile-release tárolóban
+Új build = új verzió		Verziók időbélyeggel elérhetőek a Nexusban
+
+# Slack Notification Integration-------------------------------------------------------------------
+
+Cél: Minden Jenkins build eredmény automatikusan megjelenjen a Slack csatornán, legyen az SUCCESS vagy FAILURE.
+
+1. Slack Workspace & Channel létrehozása
+  Jelentkezz be a Slack oldalán: https://slack.com
+  Create Workspace
+  Workspace Name: vprofilecicd
+   Project/Team: devopscicd
+  Channel: jenkinscicd
+  Skip társak hozzáadását
+
+2. Jenkins CI app hozzáadása Slack-hez
+  Google-ben keresd: slack jenkins integration
+  Válaszd: Add Jenkins CI to Slack
+  Add App -> Válaszd a jenkinscicd csatornát -> Add Integration
+  Másold ki a generált token -> Mentsd le magadnak!
+
+3. Slack token hozzáadása Jenkinsbe
+Jenkins -> Manage Jenkins -> Credentials -> Global
+Add Credentials
+  Kind: Secret text
+  Secret: (Slack token)
+  ID/Description: slacktoken
+Jenkins -> Manage Jenkins -> System -> Slack
+  Workspace: vprofilecicd
+  Default channel: #jenkinscicd
+  Token: válaszd slacktoken
+  Test Connection: Success
+  Save
+
+4. Jenkinsfile frissítése – Slack Notification blokk hozzáadása
+A pipeline végéhez add hozzá a post szekciót, és definiálj egy színkód-térképet is:
+
+def COLOR_MAP = [
+    'SUCCESS': 'good',
+    'FAILURE': 'danger',
+]
+
+...
+
+post {
+    always {
+        echo 'Slack Notifications.'
+        slackSend channel: '#jenkinscicd',
+            color: COLOR_MAP[currentBuild.currentResult],
+            message: "*${currentBuild.currentResult}:* Job ${env.JOB_NAME} build ${env.BUILD_NUMBER} \n More info at: ${env.BUILD_URL}"
+    }
+}
+
+Ez biztosítja, hogy minden build után automatikusan üzenet menjen ki a Slack csatornára,
+a build állapotának megfelelő színnel és részletes információval.
+
+5. Commit & Push
+Terminál:
+  git add Jenkinsfile
+  git commit -m "Add Slack notifications"
+  git push origin jenkins-ci
+
+vagy
+
+VSCode:
+  Source Control panel -> Commit -> Commit&Push -> ✔ pipára katt -> Save
+
+6. Eredmény ellenőrzése
+Jenkins:
+  Pipeline automatikusan elindul
+  Console Output -> Finished: SUCCESS vagy FAILURE
+Slack:
+  #jenkinscicd csatornában megjelenik az üzenet:
+	*SUCCESS:* Job vprofile-ci-pipeline build #5 
+	More info at: http://your-jenkins-url/job/vprofile-ci-pipeline/5/
+Színkód:
+zöld - good = SUCCESS
+piros - danger = FAILURE
+
+Összefoglalás:
+Lépés				Eredmény
+Slack workspace létrehozva	vprofilecicd
+Jenkins CI App integrálva	Slack token létrehozva, Jenkinsbe importálva
+Jenkinsfile frissítve		post -> always -> slackSend blokk hozzáadva
+Build után Slack értesítés	Csatornában azonnali visszajelzés
+
+Kész a teljes DevOps pipeline
+Automatikus build -> Teszt -> Kódanalízis -> Quality Gate -> Artefakt feltöltés -> Slack értesítés.
+Ez már egy éles környezetre is kész CI/CD rendszer.
